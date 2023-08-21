@@ -2,6 +2,7 @@ import logging
 import validators
 import easyocr
 import io
+
 import config as cfg
 import asyncio
 
@@ -12,6 +13,7 @@ from aiogram.dispatcher import FSMContext
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from urllib.parse import urlparse, parse_qs
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
 from selenium import webdriver
 from PIL import Image
 from datetime import datetime
@@ -24,7 +26,7 @@ bot = Bot(token=cfg.TG_API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
-browser = None  # Будет хранить объект WebDriver
+user_browsers = {}  # Будет хранить объект WebDriver
 db = UserDatabase()
 
 tasks = {}  # Словарь для хранения запущенных задач для каждого пользователя
@@ -156,60 +158,66 @@ async def check_and_send_periodically(chat_id, user):
         await asyncio.sleep(int(user[1])*60)
 
 
+def recognize_captcha():
+    reader = easyocr.Reader(['ru'])  # Указываем список поддерживаемых языков
+    image = Image.open('object_screenshot.png')
+    image_bytes = io.BytesIO()
+    image.save(image_bytes, format='PNG')
+    image_bytes = image_bytes.getvalue()
+    results = reader.readtext(image_bytes, detail=0, allowlist='0123456789')
+    return int(''.join(results))
+
+
+def screenshot(browser):
+    # Делаем скриншот капчи и сохраняем в файл
+    object_element = browser.find_element("xpath", '//*[@id="ctl00_MainContent_imgSecNum"]')
+    object_screenshot = object_element.screenshot_as_png
+    with open("object_screenshot.png", "wb") as screenshot_file:
+        screenshot_file.write(object_screenshot)
+
+
 async def check_and_send(chat_id, url):
-    global browser
-    if browser is None:
+    global user_browsers
+    if chat_id not in user_browsers or user_browsers[chat_id] is None:
         chrome_options = Options()
         chrome_options.add_argument('--headless')  # Включение headless режима
         chrome_options.add_argument('--disable-gpu')  # Отключение GPU для headless режима
-        browser = webdriver.Chrome(options=chrome_options)  # Инициализация WebDriver
+        user_browsers[chat_id] = webdriver.Chrome(options=chrome_options)  # Инициализация WebDriver options=chrome_options
+        browser = user_browsers[chat_id]
     try:
         browser.get(url)
         await asyncio.sleep(1)
-        # Делаем скриншот капчи и сохраняем в файл
-        object_element = browser.find_element("xpath", '//*[@id="ctl00_MainContent_imgSecNum"]')
-        object_screenshot = object_element.screenshot_as_png
-        with open("object_screenshot.png", "wb") as screenshot_file:
-            screenshot_file.write(object_screenshot)
-
-        # Получаем цифры из капчи нейронкой
-        reader = easyocr.Reader(['ru'])  # Указываем список поддерживаемых языков
-        image_path = 'object_screenshot.png'
-        image = Image.open(image_path)
-        image_bytes = io.BytesIO()
-        image.save(image_bytes, format='PNG')
-        image_bytes = image_bytes.getvalue()
-        results = reader.readtext(image_bytes, detail=0, allowlist='0123456789')
-        verification_code = ''.join(results)
+        screenshot(browser)
+        verification_code = recognize_captcha()
 
         input_element = browser.find_element("xpath", '//*[@id="ctl00_MainContent_txtCode"]')
         input_element.send_keys(verification_code)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
         button_element = browser.find_element("xpath", '//*[@id="ctl00_MainContent_ButtonA"]')
         button_element.click()
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
         button_element = browser.find_element("xpath", '//*[@id="ctl00_MainContent_ButtonB"]')
         button_element.click()
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
         try:
             info_text = browser.find_element("xpath", '//*[@id="center-panel"]/p[1]').text
             if info_text == 'Извините, но в настоящий момент на интересующее Вас консульское действие в системе предварительной записи нет свободного времени.':
                 print(f'Нет слотов\nid: {chat_id}\nВремя: {datetime.now().strftime("%H:%M %d %B %Y")}')
-            else:
-                await bot.send_message(chat_id, f'Быстрее записываться!!!\n{url}')
-                html_code = browser.page_source
-                with open("page.html", "w", encoding="utf-8") as file:
-                    file.write(html_code)
         except:
-            await bot.send_message(chat_id, f'Быстрее записываться!!!\n{url}')
-            html_code = browser.page_source
-            with open("page.html", "w", encoding="utf-8") as file:
-                file.write(html_code)
+            first_checkbox = browser.find_element(By.ID, "ctl00_MainContent_RadioButtonList1_0")
+            first_checkbox.click()
+            button_element = browser.find_element("xpath", '//*[@id="ctl00_MainContent_Button1"]')
+            button_element.click()
+            await asyncio.sleep(1)
+            info_text = browser.find_element("xpath", '//*[@id="center-panel"]/h1').text
+            if info_text == 'ПОДТВЕРЖДЕНИЕ О ЗАПИСИ НА ПРИЕМ':
+                text_info = browser.find_element("xpath", '//*[@id="ctl00_MainContent_Label_Message"]').text
+                await bot.send_message(chat_id, f'Поздравляю, запись прошла успешно!\n{text_info}')
         browser.quit()
-        browser = None
+        user_browsers[chat_id] = None
     except:
         browser.quit()
-        browser = None
+        user_browsers[chat_id] = None
         await check_and_send(chat_id, url)
 
 
